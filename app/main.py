@@ -1,5 +1,6 @@
 import os
 
+from google.genai import errors
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -8,7 +9,10 @@ from google import genai
 from app.banking import get_account_balance
 from app.auth import get_current_customer_id
 from app.memory import get_history, add_message
-from app.transactions import get_recent_transactions
+from app.transactions import (
+    get_recent_transactions,
+    get_transaction_details,
+)
 
 load_dotenv()
 
@@ -37,6 +41,13 @@ def get_my_recent_transactions():
 
     return get_recent_transactions(customer_id)
 
+def get_my_transaction_details(transaction_id: str):
+    customer_id = get_current_customer_id()
+
+    return get_transaction_details(
+        customer_id,
+        transaction_id,
+    )
 
 @app.get("/")
 def home():
@@ -58,6 +69,7 @@ def chat(request: ChatRequest):
         request.message,
     )
 
+    try:
     response = client.models.generate_content(
         model="gemini-3.7-flash",
         contents=(
@@ -66,9 +78,25 @@ def chat(request: ChatRequest):
             f"Customer message: {request.message}"
         ),
         config={
-            "tools": [get_my_account_balance, get_my_recent_transactions]
+            "tools": [
+                get_my_account_balance,
+                get_my_recent_transactions,
+                get_my_transaction_details,
+            ]
         }
     )
+
+    except errors.ClientError as exc:
+       if exc.status_code == 429:
+           return {
+            "reply": (
+                "I'm temporarily unable to process your request "
+                "because the AI service has reached its usage limit. "
+                "Please try again later."
+            )
+        }
+
+    raise
 
     add_message(
         request.session_id,
