@@ -70,33 +70,33 @@ def chat(request: ChatRequest):
     )
 
     try:
-    response = client.models.generate_content(
-        model="gemini-3.7-flash",
-        contents=(
-            f"The authenticated customer ID is {customer_id}.\n"
-            f"Conversation history: {history}\n"
-            f"Customer message: {request.message}"
-        ),
-        config={
-            "tools": [
-                get_my_account_balance,
-                get_my_recent_transactions,
-                get_my_transaction_details,
-            ]
-        }
-    )
+        response = client.models.generate_content(
+            model="gemini-3.7-flash",
+            contents=(
+                f"The authenticated customer ID is {customer_id}.\n"
+                f"Conversation history: {history}\n"
+                f"Customer message: {request.message}"
+            ),
+            config={
+                "tools": [
+                    get_my_account_balance,
+                    get_my_recent_transactions,
+                    get_my_transaction_details,
+                ]
+            }
+        )
 
     except errors.ClientError as exc:
-       if exc.status_code == 429:
-           return {
-            "reply": (
-                "I'm temporarily unable to process your request "
-                "because the AI service has reached its usage limit. "
-                "Please try again later."
-            )
-        }
+        if exc.code == 429:
+            return {
+                "reply": (
+                    "I'm temporarily unable to process your request "
+                    "because the AI service has reached its usage limit. "
+                    "Please try again later."
+                )
+            }
 
-    raise
+        raise
 
     add_message(
         request.session_id,
