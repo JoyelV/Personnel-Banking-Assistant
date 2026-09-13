@@ -70,6 +70,43 @@ class ChatRequest(BaseModel):
     message: str
 
 
+# OpenAPI documentation for the errors returned by ai_error_response().
+# These models describe the response shape only; they are not used at runtime.
+class ErrorDetail(BaseModel):
+    code: str
+    message: str
+
+
+class ErrorResponse(BaseModel):
+    error: ErrorDetail
+
+
+RETRY_AFTER_HEADER = {
+    "Retry-After": {
+        "description": "Seconds to wait before retrying.",
+        "schema": {"type": "integer"},
+    }
+}
+
+CHAT_ERROR_RESPONSES = {
+    502: {
+        "model": ErrorResponse,
+        "description": (
+            "The AI provider rejected the request or returned no reply. "
+            "Code: AI_SERVICE_ERROR."
+        ),
+    },
+    503: {
+        "model": ErrorResponse,
+        "description": (
+            "The AI provider is busy, unavailable, or timed out. Codes: "
+            "AI_SERVICE_BUSY, AI_SERVICE_UNAVAILABLE, AI_SERVICE_TIMEOUT."
+        ),
+        "headers": RETRY_AFTER_HEADER,
+    },
+}
+
+
 def get_my_account_balance():
     customer_id = get_current_customer_id()
 
@@ -95,7 +132,7 @@ def home():
     }
 
 
-@app.post("/chat")
+@app.post("/chat", responses=CHAT_ERROR_RESPONSES)
 def chat(request: ChatRequest):
 
     customer_id = get_current_customer_id()
