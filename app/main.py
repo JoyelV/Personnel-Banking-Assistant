@@ -1,8 +1,11 @@
+import logging
 import os
 
-from google.genai import errors
+import httpx
+from google.genai import errors, types
 from dotenv import load_dotenv
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from google import genai
 
@@ -16,6 +19,8 @@ from app.transactions import (
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 app = FastAPI()
 
 api_key = os.getenv("GEMINI_API_KEY")
@@ -23,7 +28,41 @@ api_key = os.getenv("GEMINI_API_KEY")
 if not api_key:
     raise RuntimeError("GEMINI_API_KEY is not configured")
 
-client = genai.Client(api_key=api_key)
+# HttpOptions.timeout is in MILLISECONDS. httpx applies it per phase
+# (connect / write / each read), not as a total deadline, and automatic
+# function calling may make several model calls per /chat request.
+GEMINI_TIMEOUT_MS = 30_000
+
+QUOTA_RETRY_AFTER_SECONDS = 60
+UNAVAILABLE_RETRY_AFTER_SECONDS = 30
+
+client = genai.Client(
+    api_key=api_key,
+    http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
+)
+
+
+def ai_error_response(
+    status_code: int,
+    error_code: str,
+    message: str,
+    retry_after_seconds: int | None = None,
+) -> JSONResponse:
+    headers = {}
+
+    if retry_after_seconds is not None:
+        headers["Retry-After"] = str(retry_after_seconds)
+
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": {
+                "code": error_code,
+                "message": message,
+            }
+        },
+        headers=headers,
+    )
 
 
 class ChatRequest(BaseModel):
@@ -63,12 +102,6 @@ def chat(request: ChatRequest):
 
     history = get_history(request.session_id)
 
-    add_message(
-        request.session_id,
-        "user",
-        request.message,
-    )
-
     try:
         response = client.models.generate_content(
             model="gemini-3.7-flash",
@@ -86,24 +119,102 @@ def chat(request: ChatRequest):
             }
         )
 
+    # Log only the provider's code/status: never the prompt, the customer's
+    # message, the session_id, or the raw provider error text.
     except errors.ClientError as exc:
         if exc.code == 429:
-            return {
-                "reply": (
-                    "I'm temporarily unable to process your request "
-                    "because the AI service has reached its usage limit. "
-                    "Please try again later."
-                )
-            }
+            logger.warning(
+                "Gemini quota/rate limit: code=%s status=%s",
+                exc.code,
+                exc.status,
+            )
+            return ai_error_response(
+                503,
+                "AI_SERVICE_BUSY",
+                "The assistant is busy right now. Please try again in a minute.",
+                QUOTA_RETRY_AFTER_SECONDS,
+            )
 
-        raise
+        # 400/401/403/404 mean our request or configuration is wrong.
+        # Retrying will not help, so no Retry-After.
+        logger.error(
+            "Gemini rejected request: code=%s status=%s",
+            exc.code,
+            exc.status,
+        )
+        return ai_error_response(
+            502,
+            "AI_SERVICE_ERROR",
+            "The assistant could not process your request. Please try again later.",
+        )
+
+    except errors.ServerError as exc:
+        logger.warning(
+            "Gemini server error: code=%s status=%s",
+            exc.code,
+            exc.status,
+        )
+        return ai_error_response(
+            503,
+            "AI_SERVICE_UNAVAILABLE",
+            "The assistant is temporarily unavailable. Please try again shortly.",
+            UNAVAILABLE_RETRY_AFTER_SECONDS,
+        )
+
+    except errors.APIError as exc:
+        logger.error(
+            "Gemini unexpected API error: code=%s status=%s",
+            exc.code,
+            exc.status,
+        )
+        return ai_error_response(
+            502,
+            "AI_SERVICE_ERROR",
+            "The assistant could not process your request. Please try again later.",
+        )
+
+    except httpx.TimeoutException as exc:
+        logger.warning("Gemini request timed out: %s", type(exc).__name__)
+        return ai_error_response(
+            503,
+            "AI_SERVICE_TIMEOUT",
+            "The assistant took too long to respond. Please try again.",
+            UNAVAILABLE_RETRY_AFTER_SECONDS,
+        )
+
+    except httpx.TransportError as exc:
+        logger.warning("Gemini network error: %s", type(exc).__name__)
+        return ai_error_response(
+            503,
+            "AI_SERVICE_UNAVAILABLE",
+            "The assistant is temporarily unavailable. Please try again shortly.",
+            UNAVAILABLE_RETRY_AFTER_SECONDS,
+        )
+
+    reply = response.text
+
+    if not reply:
+        logger.error("Gemini returned an empty response")
+        return ai_error_response(
+            502,
+            "AI_SERVICE_ERROR",
+            "The assistant could not process your request. Please try again later.",
+        )
+
+    # Save the exchange only after success, so a failed request never
+    # leaves an unanswered user message in the session.
+    add_message(
+        request.session_id,
+        "user",
+        request.message,
+    )
 
     add_message(
         request.session_id,
         "assistant",
-        response.text,
+        reply,
     )
 
     return {
-        "reply": response.text
+        "reply": reply
     }
