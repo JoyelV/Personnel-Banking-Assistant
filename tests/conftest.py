@@ -14,7 +14,7 @@ os.environ["GEMINI_API_KEY"] = TEST_API_KEY
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from app import main, memory  # noqa: E402
+from app import conversation, llm, main  # noqa: E402
 
 
 class NetworkBlockedError(RuntimeError):
@@ -68,15 +68,15 @@ def block_network():
 def fake_gemini(monkeypatch):
     """Replace the real Gemini client for every test."""
     fake_client = FakeClient()
-    monkeypatch.setattr(main, "client", fake_client)
+    monkeypatch.setattr(llm, "client", fake_client)
     return fake_client.models
 
 
 @pytest.fixture(autouse=True)
 def clean_sessions():
-    memory.sessions.clear()
+    conversation.store.clear()
     yield
-    memory.sessions.clear()
+    conversation.store.clear()
 
 
 @pytest.fixture

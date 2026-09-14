@@ -1,48 +1,28 @@
 import logging
-import os
+import uuid
 
 import httpx
-from google.genai import errors, types
-from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from google.genai import errors
 from pydantic import BaseModel
-from google import genai
 
-from app.banking import get_account_balance
 from app.auth import get_current_customer_id
-from app.memory import get_history, add_message
-from app.transactions import (
-    get_recent_transactions,
-    get_transaction_details,
-)
-
-load_dotenv()
+from app.context import RequestContext
+from app.conversation import ConversationBusyError, store
+from app.llm import EmptyModelReply
+from app.orchestrator import run_turn
+from app.tools import ToolExecutor
 
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-api_key = os.getenv("GEMINI_API_KEY")
-
-if not api_key:
-    raise RuntimeError("GEMINI_API_KEY is not configured")
-
-# HttpOptions.timeout is in MILLISECONDS. httpx applies it per phase
-# (connect / write / each read), not as a total deadline, and automatic
-# function calling may make several model calls per /chat request.
-GEMINI_TIMEOUT_MS = 30_000
-
 QUOTA_RETRY_AFTER_SECONDS = 60
 UNAVAILABLE_RETRY_AFTER_SECONDS = 30
 
-client = genai.Client(
-    api_key=api_key,
-    http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
-)
 
-
-def ai_error_response(
+def error_response(
     status_code: int,
     error_code: str,
     message: str,
@@ -70,7 +50,7 @@ class ChatRequest(BaseModel):
     message: str
 
 
-# OpenAPI documentation for the errors returned by ai_error_response().
+# OpenAPI documentation for the errors returned by error_response().
 # These models describe the response shape only; they are not used at runtime.
 class ErrorDetail(BaseModel):
     code: str
@@ -89,6 +69,13 @@ RETRY_AFTER_HEADER = {
 }
 
 CHAT_ERROR_RESPONSES = {
+    409: {
+        "model": ErrorResponse,
+        "description": (
+            "Another message in this conversation is still being processed. "
+            "Code: CONVERSATION_BUSY."
+        ),
+    },
     502: {
         "model": ErrorResponse,
         "description": (
@@ -107,24 +94,6 @@ CHAT_ERROR_RESPONSES = {
 }
 
 
-def get_my_account_balance():
-    customer_id = get_current_customer_id()
-
-    return get_account_balance(customer_id)
-
-def get_my_recent_transactions():
-    customer_id = get_current_customer_id()
-
-    return get_recent_transactions(customer_id)
-
-def get_my_transaction_details(transaction_id: str):
-    customer_id = get_current_customer_id()
-
-    return get_transaction_details(
-        customer_id,
-        transaction_id,
-    )
-
 @app.get("/")
 def home():
     return {
@@ -135,25 +104,39 @@ def home():
 @app.post("/chat", responses=CHAT_ERROR_RESPONSES)
 def chat(request: ChatRequest):
 
-    customer_id = get_current_customer_id()
-
-    history = get_history(request.session_id)
+    # Identity comes from the backend only. It goes to the tool executor
+    # and is never sent to the model.
+    ctx = RequestContext(
+        customer_id=get_current_customer_id(),
+        session_id=request.session_id,
+        request_id=uuid.uuid4().hex,
+    )
 
     try:
-        response = client.models.generate_content(
-            model="gemini-3.7-flash",
-            contents=(
-                f"The authenticated customer ID is {customer_id}.\n"
-                f"Conversation history: {history}\n"
-                f"Customer message: {request.message}"
-            ),
-            config={
-                "tools": [
-                    get_my_account_balance,
-                    get_my_recent_transactions,
-                    get_my_transaction_details,
-                ]
-            }
+        with store.turn(ctx.session_id):
+            executor = ToolExecutor(ctx)
+
+            try:
+                reply = run_turn(
+                    store.recent_messages(ctx.session_id),
+                    request.message,
+                    executor,
+                )
+            finally:
+                # Executed tool calls are audited even if the turn fails.
+                store.record_tool_calls(ctx.session_id, executor.records)
+
+            # Save the exchange only after success, so a failed request never
+            # leaves an unanswered user message in the session.
+            store.commit_turn(ctx.session_id, request.message, reply)
+
+    except ConversationBusyError:
+        logger.warning("Conversation busy: request_id=%s", ctx.request_id)
+        return error_response(
+            409,
+            "CONVERSATION_BUSY",
+            "Your previous message is still being processed. "
+            "Please wait for the reply and try again.",
         )
 
     # Log only the provider's code/status: never the prompt, the customer's
@@ -165,7 +148,7 @@ def chat(request: ChatRequest):
                 exc.code,
                 exc.status,
             )
-            return ai_error_response(
+            return error_response(
                 503,
                 "AI_SERVICE_BUSY",
                 "The assistant is busy right now. Please try again in a minute.",
@@ -179,7 +162,7 @@ def chat(request: ChatRequest):
             exc.code,
             exc.status,
         )
-        return ai_error_response(
+        return error_response(
             502,
             "AI_SERVICE_ERROR",
             "The assistant could not process your request. Please try again later.",
@@ -191,7 +174,7 @@ def chat(request: ChatRequest):
             exc.code,
             exc.status,
         )
-        return ai_error_response(
+        return error_response(
             503,
             "AI_SERVICE_UNAVAILABLE",
             "The assistant is temporarily unavailable. Please try again shortly.",
@@ -204,7 +187,7 @@ def chat(request: ChatRequest):
             exc.code,
             exc.status,
         )
-        return ai_error_response(
+        return error_response(
             502,
             "AI_SERVICE_ERROR",
             "The assistant could not process your request. Please try again later.",
@@ -212,7 +195,7 @@ def chat(request: ChatRequest):
 
     except httpx.TimeoutException as exc:
         logger.warning("Gemini request timed out: %s", type(exc).__name__)
-        return ai_error_response(
+        return error_response(
             503,
             "AI_SERVICE_TIMEOUT",
             "The assistant took too long to respond. Please try again.",
@@ -221,36 +204,20 @@ def chat(request: ChatRequest):
 
     except httpx.TransportError as exc:
         logger.warning("Gemini network error: %s", type(exc).__name__)
-        return ai_error_response(
+        return error_response(
             503,
             "AI_SERVICE_UNAVAILABLE",
             "The assistant is temporarily unavailable. Please try again shortly.",
             UNAVAILABLE_RETRY_AFTER_SECONDS,
         )
 
-    reply = response.text
-
-    if not reply:
+    except EmptyModelReply:
         logger.error("Gemini returned an empty response")
-        return ai_error_response(
+        return error_response(
             502,
             "AI_SERVICE_ERROR",
             "The assistant could not process your request. Please try again later.",
         )
-
-    # Save the exchange only after success, so a failed request never
-    # leaves an unanswered user message in the session.
-    add_message(
-        request.session_id,
-        "user",
-        request.message,
-    )
-
-    add_message(
-        request.session_id,
-        "assistant",
-        reply,
-    )
 
     return {
         "reply": reply

@@ -1,20 +1,21 @@
 """Gemini failures must map to stable, safe HTTP errors (STEP 2 contract)."""
 
-import copy
 import logging
-from types import SimpleNamespace
 
 import httpx
 import pytest
 from google.genai import errors
 
-from app import main, memory
+from app import main
+from app.conversation import store
 from tests.fakes import (
     CUSTOMER_MESSAGE,
     PROVIDER_SECRET,
     SENSITIVE_VALUES,
     SESSION_ID,
+    empty_response,
     provider_error,
+    text_response,
 )
 
 EXPECTED_MESSAGES = {
@@ -72,15 +73,14 @@ FAILURE_CASES = [
 ]
 
 EMPTY_REPLY_CASES = [
-    pytest.param(None, id="text-none"),
-    pytest.param("", id="text-empty"),
+    pytest.param(empty_response, id="no-candidates"),
+    pytest.param(lambda: text_response(""), id="text-empty"),
 ]
 
 
 def seed_history():
-    memory.add_message(SESSION_ID, "user", "earlier question")
-    memory.add_message(SESSION_ID, "assistant", "earlier answer")
-    return copy.deepcopy(memory.get_history(SESSION_ID))
+    store.commit_turn(SESSION_ID, "earlier question", "earlier answer")
+    return store.messages(SESSION_ID)
 
 
 def post_chat(client):
@@ -121,18 +121,18 @@ def test_gemini_failure_returns_safe_error(
     response = post_chat(client)
 
     assert_safe_error(response, all_logs, status, code, retry_after)
-    assert memory.get_history(SESSION_ID) == history_before
+    assert store.messages(SESSION_ID) == history_before
 
 
-@pytest.mark.parametrize("text", EMPTY_REPLY_CASES)
-def test_empty_reply_returns_safe_error(client, fake_gemini, all_logs, text):
+@pytest.mark.parametrize("make_response", EMPTY_REPLY_CASES)
+def test_empty_reply_returns_safe_error(client, fake_gemini, all_logs, make_response):
     history_before = seed_history()
-    fake_gemini.runs(lambda **_: SimpleNamespace(text=text))
+    fake_gemini.runs(lambda **_: make_response())
 
     response = post_chat(client)
 
     assert_safe_error(response, all_logs, 502, "AI_SERVICE_ERROR", None)
-    assert memory.get_history(SESSION_ID) == history_before
+    assert store.messages(SESSION_ID) == history_before
 
 
 @pytest.mark.parametrize("make_exc, status, code, retry_after", FAILURE_CASES)
@@ -144,7 +144,7 @@ def test_failure_on_new_session_saves_nothing(
     response = post_chat(client)
 
     assert response.status_code == status
-    assert memory.sessions == {}
+    assert store.session_ids() == set()
 
 
 def test_unexpected_application_error_returns_generic_500(
@@ -159,4 +159,4 @@ def test_unexpected_application_error_returns_generic_500(
     assert response.text == "Internal Server Error"
     assert PROVIDER_SECRET not in response.text
     assert CUSTOMER_MESSAGE not in response.text
-    assert memory.get_history(SESSION_ID) == history_before
+    assert store.messages(SESSION_ID) == history_before

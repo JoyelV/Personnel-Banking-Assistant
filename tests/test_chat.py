@@ -4,15 +4,16 @@ import os
 
 import pytest
 
-from app import main, memory
-from tests.fakes import CUSTOMER_MESSAGE, SESSION_ID, TEST_API_KEY
+from app import llm
+from app.conversation import Message, store
+from tests.fakes import CUSTOMER_MESSAGE, SESSION_ID, TEST_API_KEY, everything_sent
 
 REPLY = "Your balance is 25,430.50 INR."
 
 
 def test_app_uses_dummy_key_not_real_env_key():
     assert os.environ["GEMINI_API_KEY"] == TEST_API_KEY
-    assert main.api_key == TEST_API_KEY
+    assert llm.api_key == TEST_API_KEY
 
 
 def test_home_returns_running_message(client):
@@ -38,7 +39,7 @@ def test_chat_success_returns_reply(client, fake_gemini):
 def test_sessions_start_empty_after_previous_test():
     # The previous test saved messages; the clean_sessions fixture must
     # have discarded them.
-    assert memory.sessions == {}
+    assert store.session_ids() == set()
 
 
 def test_success_saves_user_then_assistant(client, fake_gemini):
@@ -49,9 +50,9 @@ def test_success_saves_user_then_assistant(client, fake_gemini):
         json={"session_id": SESSION_ID, "message": CUSTOMER_MESSAGE},
     )
 
-    assert memory.get_history(SESSION_ID) == [
-        {"role": "user", "content": CUSTOMER_MESSAGE},
-        {"role": "assistant", "content": REPLY},
+    assert store.messages(SESSION_ID) == [
+        Message("user", CUSTOMER_MESSAGE),
+        Message("assistant", REPLY),
     ]
 
 
@@ -63,12 +64,19 @@ def test_second_turn_sends_history_and_current_message_once(client, fake_gemini)
     client.post("/chat", json={"session_id": SESSION_ID, "message": first_message})
     client.post("/chat", json={"session_id": SESSION_ID, "message": second_message})
 
-    second_prompt = fake_gemini.calls[1]["contents"]
-    assert second_prompt.count(first_message) == 1
-    assert second_prompt.count(second_message) == 1
-    assert second_prompt.index(first_message) < second_prompt.index(second_message)
+    second_request = fake_gemini.calls[1]["contents"]
+    assert [content.role for content in second_request] == ["user", "model", "user"]
+    assert [content.parts[0].text for content in second_request] == [
+        first_message,
+        REPLY,
+        second_message,
+    ]
 
-    assert [m["content"] for m in memory.get_history(SESSION_ID)] == [
+    sent = everything_sent(fake_gemini.calls[1])
+    assert sent.count(first_message) == 1
+    assert sent.count(second_message) == 1
+
+    assert [m.content for m in store.messages(SESSION_ID)] == [
         first_message,
         REPLY,
         second_message,
@@ -82,12 +90,12 @@ def test_sessions_do_not_share_history(client, fake_gemini):
     client.post("/chat", json={"session_id": "session-a", "message": "message-a"})
     client.post("/chat", json={"session_id": "session-b", "message": "message-b"})
 
-    assert "message-a" not in fake_gemini.calls[1]["contents"]
-    assert memory.get_history("session-a")[0]["content"] == "message-a"
-    assert memory.get_history("session-b")[0]["content"] == "message-b"
+    assert "message-a" not in everything_sent(fake_gemini.calls[1])
+    assert store.messages("session-a")[0].content == "message-a"
+    assert store.messages("session-b")[0].content == "message-b"
 
 
-def test_prompt_uses_backend_identity_and_never_the_api_key(client, fake_gemini):
+def test_model_is_never_told_customer_identity_or_api_key(client, fake_gemini):
     fake_gemini.returns(REPLY)
 
     client.post(
@@ -95,9 +103,10 @@ def test_prompt_uses_backend_identity_and_never_the_api_key(client, fake_gemini)
         json={"session_id": SESSION_ID, "message": CUSTOMER_MESSAGE},
     )
 
-    prompt = fake_gemini.calls[0]["contents"]
-    assert "The authenticated customer ID is CUST001." in prompt
-    assert TEST_API_KEY not in prompt
+    sent = everything_sent(fake_gemini.calls[0])
+    for customer_id in ("CUST001", "CUST002", "CUST003"):
+        assert customer_id not in sent
+    assert TEST_API_KEY not in sent
 
 
 @pytest.mark.parametrize(
@@ -114,7 +123,7 @@ def test_malformed_chat_request_returns_422(client, fake_gemini, body):
 
     assert response.status_code == 422
     assert fake_gemini.calls == []
-    assert memory.sessions == {}
+    assert store.session_ids() == set()
 
 
 def test_invalid_json_returns_422(client, fake_gemini):
@@ -132,19 +141,21 @@ def test_openapi_documents_chat_error_responses(client):
     spec = client.get("/openapi.json").json()
     responses = spec["paths"]["/chat"]["post"]["responses"]
 
-    assert {"200", "422", "502", "503"} <= set(responses)
+    assert {"200", "409", "422", "502", "503"} <= set(responses)
 
     error_ref = "#/components/schemas/ErrorResponse"
-    for status in ("502", "503"):
+    for status in ("409", "502", "503"):
         schema = responses[status]["content"]["application/json"]["schema"]
         assert schema == {"$ref": error_ref}
 
+    assert "CONVERSATION_BUSY" in responses["409"]["description"]
     assert "AI_SERVICE_ERROR" in responses["502"]["description"]
     for code in ("AI_SERVICE_BUSY", "AI_SERVICE_UNAVAILABLE", "AI_SERVICE_TIMEOUT"):
         assert code in responses["503"]["description"]
 
     assert "Retry-After" in responses["503"]["headers"]
     assert "headers" not in responses["502"]
+    assert "headers" not in responses["409"]
 
     schemas = spec["components"]["schemas"]
     assert schemas["ErrorResponse"]["required"] == ["error"]
