@@ -8,15 +8,21 @@ from google.genai import errors
 from pydantic import BaseModel
 
 from app.auth import get_current_customer_id
+from app.banking import BankingService
 from app.context import RequestContext
 from app.conversation import ConversationBusyError, store
 from app.llm import EmptyModelReply
+from app.mock_banking import MockBankingService
 from app.orchestrator import run_turn
 from app.tools import ToolExecutor
 
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
+
+# The banking backend. A real adapter replaces the mock here; the tools,
+# agent loop and Gemini integration do not change.
+banking_service: BankingService = MockBankingService()
 
 QUOTA_RETRY_AFTER_SECONDS = 60
 UNAVAILABLE_RETRY_AFTER_SECONDS = 30
@@ -114,7 +120,7 @@ def chat(request: ChatRequest):
 
     try:
         with store.turn(ctx.session_id):
-            executor = ToolExecutor(ctx)
+            executor = ToolExecutor(ctx, banking_service)
 
             try:
                 reply = run_turn(

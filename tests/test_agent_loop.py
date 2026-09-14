@@ -10,12 +10,14 @@ from google import genai
 from google.genai import errors, types
 from google.genai import models as genai_models
 
-from app import llm, main, tools
+from app import llm, main
+from app.banking import RECENT_TRANSACTIONS_LIMIT, BankingUnavailable
 from app.conversation import HISTORY_WINDOW_MESSAGES, Message, store
 from app.orchestrator import LIMITS, build_contents
 from app.tools import declarations
 from tests.fakes import (
     INTERNAL_SECRET,
+    FakeBankingService,
     SESSION_ID,
     TEST_API_KEY,
     everything_sent,
@@ -50,6 +52,7 @@ def test_approved_limits():
         LIMITS.max_tool_calls_total,
     ) == (3, 3, 5)
     assert HISTORY_WINDOW_MESSAGES == 20
+    assert RECENT_TRANSACTIONS_LIMIT == 10
 
 
 def test_backend_runs_the_requested_tool_and_replays_model_content(client, fake_gemini):
@@ -73,7 +76,7 @@ def test_backend_runs_the_requested_tool_and_replays_model_content(client, fake_
     assert second_request[-1].role == "user"
     [result] = function_responses(fake_gemini.calls[1])
     assert (result.id, result.name) == ("call-0", "get_my_transaction_details")
-    assert result.response["output"]["amount"] == 2500.00
+    assert result.response["output"]["amount"] == "2500.00"
 
     assert audit() == [
         ("get_my_transaction_details", {"transaction_id": "TXN1001"}, "ok")
@@ -115,9 +118,9 @@ def test_identity_claims_cannot_reach_another_customer(client, fake_gemini, mess
     assert audit() == [
         ("get_my_account_balance", None, "invalid_arguments"),
         ("get_my_transaction_details", None, "invalid_arguments"),
-        ("get_my_transaction_details", {"transaction_id": "TXN2001"}, "ok"),
+        ("get_my_transaction_details", {"transaction_id": "TXN2001"}, "not_found"),
     ]
-    assert results[2].response["output"] == {"found": False, "transaction_id": "TXN2001"}
+    assert results[2].response["error"]["code"] == "not_found"
 
 
 def test_model_never_receives_customer_identity(client, fake_gemini):
@@ -155,10 +158,8 @@ def test_unknown_tool_is_refused_without_breaking_the_turn(client, fake_gemini, 
 
 
 def test_malformed_transaction_id_never_reaches_banking_data(client, fake_gemini, monkeypatch):
-    def fail_if_called(*args):
-        raise AssertionError("banking data was accessed")
-
-    monkeypatch.setattr(tools, "get_transaction_details", fail_if_called)
+    spy = FakeBankingService()
+    monkeypatch.setattr(main, "banking_service", spy)
     fake_gemini.script(
         function_call_response(details("../CUST002/TXN2001")),
         text_response("That is not a valid transaction ID."),
@@ -169,13 +170,13 @@ def test_malformed_transaction_id_never_reaches_banking_data(client, fake_gemini
     assert response.status_code == 200
     [result] = function_responses(fake_gemini.calls[1])
     assert result.response["error"]["code"] == "invalid_arguments"
+    assert spy.customer_ids == []
 
 
 def test_internal_tool_error_is_not_exposed(client, fake_gemini, all_logs, monkeypatch):
-    def broken(customer_id, transaction_id):
-        raise RuntimeError(INTERNAL_SECRET)
-
-    monkeypatch.setattr(tools, "get_transaction_details", broken)
+    monkeypatch.setattr(
+        main, "banking_service", FakeBankingService(error=RuntimeError(INTERNAL_SECRET))
+    )
     fake_gemini.script(
         function_call_response(details()),
         text_response("That information is unavailable right now."),
@@ -299,7 +300,7 @@ def test_real_sdk_never_executes_tools_and_does_not_warn(monkeypatch, caplog):
     # Contract test against the installed google-genai SDK. Only its private
     # HTTP method is replaced, so this may need updating on SDK upgrades.
     configs = []
-    executed = []
+    spy = FakeBankingService()
 
     def fake_http_call(self, *, model, contents, config):
         configs.append(config)
@@ -307,7 +308,7 @@ def test_real_sdk_never_executes_tools_and_does_not_warn(monkeypatch, caplog):
 
     monkeypatch.setattr(genai_models.Models, "_generate_content", fake_http_call)
     monkeypatch.setattr(genai_models.Models, "_logged_afc_warning", False)
-    monkeypatch.setattr(tools, "get_account_balance", lambda cid: executed.append(cid))
+    monkeypatch.setattr(main, "banking_service", spy)
     monkeypatch.setattr(llm, "client", genai.Client(api_key=TEST_API_KEY))
     caplog.set_level(logging.DEBUG)
 
@@ -318,7 +319,7 @@ def test_real_sdk_never_executes_tools_and_does_not_warn(monkeypatch, caplog):
     assert [call.name for call in llm.function_calls(response)] == [
         "get_my_account_balance"
     ]
-    assert executed == []
+    assert spy.customer_ids == []
     assert len(configs) == 1
     assert "automatic function calling" not in caplog.text.lower()
 
@@ -385,3 +386,41 @@ def test_session_is_released_after_a_failure(client_no_raise, fake_gemini, failu
 
     fake_gemini.returns("ok")
     assert post(client_no_raise).status_code == 200
+
+
+def test_banking_outage_is_a_controlled_tool_error(client, fake_gemini, monkeypatch):
+    monkeypatch.setattr(
+        main, "banking_service", FakeBankingService(error=BankingUnavailable(INTERNAL_SECRET))
+    )
+    fake_gemini.script(
+        function_call_response(BALANCE),
+        text_response("The banking service is unavailable right now."),
+    )
+
+    response = post(client)
+
+    assert response.status_code == 200
+    [result] = function_responses(fake_gemini.calls[1])
+    assert result.response == {
+        "error": {
+            "code": "banking_unavailable",
+            "message": "The banking service is temporarily unavailable.",
+        }
+    }
+    assert INTERNAL_SECRET not in everything_sent(fake_gemini.calls[1])
+    assert audit() == [("get_my_account_balance", {}, "banking_unavailable")]
+
+
+def test_backend_identity_without_a_banking_record(client, fake_gemini, monkeypatch):
+    monkeypatch.setattr(main, "get_current_customer_id", lambda: "CUST999")
+    fake_gemini.script(
+        function_call_response(BALANCE),
+        text_response("Your account information is unavailable."),
+    )
+
+    response = post(client)
+
+    assert response.status_code == 200
+    [result] = function_responses(fake_gemini.calls[1])
+    assert result.response["error"]["code"] == "account_unavailable"
+    assert "CUST999" not in everything_sent(fake_gemini.calls[1])

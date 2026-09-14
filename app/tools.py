@@ -1,20 +1,30 @@
 """Banking tools offered to the model, and the backend executor that runs them.
 
 The model can only *request* a tool call. ToolExecutor decides what happens:
-it checks the tool name, validates the arguments, takes the customer identity
-from the RequestContext, authorizes, executes, and returns a controlled result.
+it checks the tool name, validates the arguments, authorizes, binds a banking
+view to the backend's customer, executes, and returns a controlled result.
 """
 
 import logging
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, Callable
 
 from google.genai import types
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from app.banking import get_account_balance
+from app.banking import (
+    TRANSACTION_ID_PATTERN,
+    BankingError,
+    BankingService,
+    BankingUnavailable,
+    CustomerBanking,
+    CustomerNotFound,
+    InvalidTransactionReference,
+    Transaction,
+    TransactionNotFound,
+)
 from app.context import RequestContext
-from app.transactions import get_recent_transactions, get_transaction_details
 
 logger = logging.getLogger(__name__)
 
@@ -30,8 +40,7 @@ class NoArgs(ToolArgs):
 
 
 class TransactionDetailsArgs(ToolArgs):
-    # Matches the mock data's ID format; revisit with the real banking API.
-    transaction_id: str = Field(pattern=r"^TXN[0-9]{4,12}$")
+    transaction_id: str = Field(pattern=TRANSACTION_ID_PATTERN)
 
 
 @dataclass(frozen=True)
@@ -40,7 +49,7 @@ class ToolSpec:
     description: str
     args_model: type[ToolArgs]
     parameters: types.Schema | None
-    handler: Callable[[RequestContext, Any], dict]
+    handler: Callable[[CustomerBanking, Any], dict]
 
     def declaration(self) -> types.FunctionDeclaration:
         return types.FunctionDeclaration(
@@ -50,24 +59,41 @@ class ToolSpec:
         )
 
 
-# Handlers shape their results explicitly: only fields the model needs,
-# and never the customer identity.
-def _account_balance(ctx: RequestContext, args: NoArgs) -> dict:
-    account = get_account_balance(ctx.customer_id)
+# Handlers receive a view already bound to the backend's customer. They never
+# see the RequestContext or any customer ID, and they choose exactly which
+# fields reach the model. Money is sent as an exact decimal string.
+def _money(amount: Decimal) -> str:
+    return format(amount, "f")
 
+
+def _transaction_json(transaction: Transaction) -> dict:
     return {
-        "found": account["found"],
-        "balance": account["balance"],
-        "currency": account["currency"],
+        "transaction_id": transaction.transaction_id,
+        "date": transaction.date.isoformat(),
+        "type": transaction.type.value,
+        "amount": _money(transaction.amount),
+        "currency": transaction.currency,
+        "description": transaction.description,
     }
 
 
-def _recent_transactions(ctx: RequestContext, args: NoArgs) -> dict:
-    return {"transactions": get_recent_transactions(ctx.customer_id)}
+def _account_balance(banking: CustomerBanking, args: NoArgs) -> dict:
+    balance = banking.get_balance()
+
+    return {"balance": _money(balance.amount), "currency": balance.currency}
 
 
-def _transaction_details(ctx: RequestContext, args: TransactionDetailsArgs) -> dict:
-    return get_transaction_details(ctx.customer_id, args.transaction_id)
+def _recent_transactions(banking: CustomerBanking, args: NoArgs) -> dict:
+    return {
+        "transactions": [
+            _transaction_json(transaction)
+            for transaction in banking.get_recent_transactions()
+        ]
+    }
+
+
+def _transaction_details(banking: CustomerBanking, args: TransactionDetailsArgs) -> dict:
+    return _transaction_json(banking.get_transaction(args.transaction_id))
 
 
 TOOL_REGISTRY: dict[str, ToolSpec] = {
@@ -82,7 +108,7 @@ TOOL_REGISTRY: dict[str, ToolSpec] = {
         ),
         ToolSpec(
             name="get_my_recent_transactions",
-            description="List the customer's recent transactions.",
+            description="List the customer's most recent transactions, newest first.",
             args_model=NoArgs,
             parameters=None,
             handler=_recent_transactions,
@@ -119,9 +145,9 @@ class ToolNotAuthorized(Exception):
 
 
 def authorize(ctx: RequestContext, spec: ToolSpec) -> None:
-    # Every current tool reads the requesting customer's own data, and the
-    # handlers look data up by ctx.customer_id, so ownership is enforced by
-    # construction. Real authorization rules arrive with STEP 6.
+    # Every current tool reads the requesting customer's own data through a
+    # view bound to ctx.customer_id, so ownership is enforced by construction.
+    # Real authorization rules arrive with STEP 6.
     if not ctx.customer_id:
         raise ToolNotAuthorized(spec.name)
 
@@ -140,9 +166,24 @@ TOOL_ERROR_MESSAGES = {
     "unknown_tool": "This tool does not exist.",
     "invalid_arguments": "The tool arguments were invalid.",
     "unauthorized": "This tool call is not authorized.",
+    "not_found": "No matching transaction was found for this customer.",
+    "account_unavailable": "The customer's account information is unavailable.",
+    "banking_unavailable": "The banking service is temporarily unavailable.",
     "failed": "The tool is temporarily unavailable.",
     "budget_exceeded": "The tool call limit for this request was reached.",
 }
+
+
+def _banking_error_status(exc: BankingError) -> str:
+    if isinstance(exc, TransactionNotFound):
+        return "not_found"
+    if isinstance(exc, InvalidTransactionReference):
+        return "invalid_arguments"
+    if isinstance(exc, CustomerNotFound):
+        return "account_unavailable"
+    if isinstance(exc, BankingUnavailable):
+        return "banking_unavailable"
+    return "failed"
 
 
 class ToolExecutor:
@@ -151,9 +192,11 @@ class ToolExecutor:
     def __init__(
         self,
         ctx: RequestContext,
+        banking_service: BankingService,
         registry: dict[str, ToolSpec] = TOOL_REGISTRY,
     ):
         self._ctx = ctx
+        self._banking_service = banking_service
         self._registry = registry
         self.calls_used = 0
         self.records: list[ToolAuditRecord] = []
@@ -177,7 +220,20 @@ class ToolExecutor:
             return self._error(call, "unauthorized", args)
 
         try:
-            result = spec.handler(self._ctx, args)
+            # Banking access is bound to the backend's customer, and only
+            # after the call has been validated and authorized.
+            banking = self._banking_service.for_customer(self._ctx.customer_id)
+            result = spec.handler(banking, args)
+        except BankingError as exc:
+            status = _banking_error_status(exc)
+            if status in ("account_unavailable", "banking_unavailable", "failed"):
+                logger.warning(
+                    "Banking error: tool=%s error=%s request_id=%s",
+                    spec.name,
+                    type(exc).__name__,
+                    self._ctx.request_id,
+                )
+            return self._error(call, status, args)
         except Exception as exc:
             logger.error(
                 "Tool failed: tool=%s error=%s request_id=%s",

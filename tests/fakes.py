@@ -5,6 +5,8 @@ Nothing in this module may reach the real Gemini API.
 
 from google.genai import errors, types
 
+from app.mock_banking import MockBankingService
+
 # Fake credentials installed by conftest.py before app.main is imported.
 TEST_API_KEY = "test-dummy-key-not-real-7c1e"
 
@@ -147,3 +149,23 @@ class FakeModels:
 class FakeClient:
     def __init__(self):
         self.models = FakeModels()
+
+
+class FakeBankingService:
+    """BankingService double that records every access and can fail.
+
+    Without an error it serves the seeded mock data.
+    """
+
+    def __init__(self, error: BaseException | None = None):
+        self.error = error
+        self.customer_ids: list[str] = []
+        self._mock = MockBankingService()
+
+    def for_customer(self, customer_id: str):
+        self.customer_ids.append(customer_id)
+
+        if self.error is not None:
+            raise self.error
+
+        return self._mock.for_customer(customer_id)
